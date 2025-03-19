@@ -1,88 +1,78 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-/**
- * @title LiquidityPoolTokens
- * @dev A simplified token contract for a single user to harvest profits via buy/sell cycles.
- * Features:
- * - Buy LPT with ETH, increasing price with each purchase
- * - Sell LPT for ETH when profitable, reducing price
- * - 10% fee on buy/sell added to dividends, withdrawable for reinvestment
- * - Core logic: dynamic pricing, profit harvesting, 10% reinvestment
- */
-contract LiquidityPoolTokens {
-    /*=================================
-    =            MODIFIERS            =
-    =================================*/
-    modifier onlyHolder() {
-        require(tokenBalanceLedger[msg.sender] > 0, "Must hold tokens");
-        _;
-    }
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
 
-    modifier hasDividends() {
-        require(myDividends() > 0, "No dividends available");
-        _;
-    }
-
-    /*==============================
-    =            EVENTS            =
-    ==============================*/
-    event TokenPurchase(address indexed buyer, uint256 ethIn, uint256 tokensMinted);
-    event TokenSale(address indexed seller, uint256 tokensBurned, uint256 ethOut);
-    event Withdraw(address indexed user, uint256 ethWithdrawn);
-
-    /*=====================================
-    =            CONFIGURABLES            =
+contract LiquidityPoolTokens is ERC20, Ownable {
+    /*===================================== 
+    =        CONFIGURABLES & CONSTANTS     = 
     =====================================*/
-    string public name = "Liquidity Pool Tokens";
-    string public symbol = "LPT";
-    uint8 public constant decimals = 18;
     uint256 public constant dividendFee = 10; // 10% fee for dividends
     uint256 public constant tokenPriceInitial = 0.0000001 ether;
     uint256 public constant tokenPriceIncremental = 0.00000001 ether;
     uint256 public constant magnitude = 2 ** 64; // Scaling factor for precision
 
-    /*================================
-    =            STORAGE            =
+    /*================================ 
+    =            STORAGE            = 
     ================================*/
-    mapping(address => uint256) private tokenBalanceLedger; // Tracks LPT balances
-    mapping(address => int256) private payoutsTo;          // Tracks dividend payouts
-    uint256 private tokenSupply = 0;                       // Total LPT supply
-    uint256 private profitPerShare = 0;                    // Dividends per token
+    mapping(address => int256) private payoutsTo; // Tracks dividend payouts
+    uint256 private profitPerShare = 0; // Dividends per token
 
-    /*=======================================
-    =            PUBLIC FUNCTIONS           =
+    /*============================== 
+    =            EVENTS            = 
+    ==============================*/
+    event TokenPurchase(
+        address indexed buyer,
+        uint256 ethIn,
+        uint256 tokensMinted
+    );
+    event TokenSale(
+        address indexed seller,
+        uint256 tokensBurned,
+        uint256 ethOut
+    );
+    event Withdraw(address indexed user, uint256 ethWithdrawn);
+
+    /*======================================= 
+    =            CONSTRUCTOR               = 
     =======================================*/
-    constructor() {
-        // No admin or treasury needed for single-user focus
-    }
+    constructor() ERC20("Liquidity Pool Tokens", "LPT") Ownable(msg.sender) {}
 
+    /*======================================= 
+    =            PUBLIC FUNCTIONS          = 
+    =======================================*/
     // Fallback to buy tokens
     receive() external payable {
         purchaseTokens(msg.value);
     }
 
     // Buy LPT with ETH
-    function buy() external payable returns (uint256) {
-        return purchaseTokens(msg.value);
+    function buy() external payable {
+        purchaseTokens(msg.value);
     }
 
     // Sell LPT for ETH
-    function sell(uint256 _amountOfTokens) external onlyHolder {
-        address seller = msg.sender;
-        require(_amountOfTokens <= tokenBalanceLedger[seller], "Insufficient tokens");
+    function sell(uint256 _amountOfTokens) external {
+        require(
+            _amountOfTokens <= balanceOf(msg.sender),
+            "Insufficient tokens"
+        );
 
+        address seller = msg.sender;
         uint256 eth = tokensToEthereum(_amountOfTokens);
         uint256 dividends = eth / dividendFee;
         uint256 taxedEth = eth - dividends;
 
-        tokenSupply -= _amountOfTokens;
-        tokenBalanceLedger[seller] -= _amountOfTokens;
-        int256 updatedPayouts = int256(profitPerShare  * _amountOfTokens + (taxedEth * magnitude));
+        _burn(seller, _amountOfTokens);
+
+        int256 updatedPayouts = int256(
+            profitPerShare * _amountOfTokens + (taxedEth * magnitude)
+        );
         payoutsTo[seller] -= updatedPayouts;
 
-        if (tokenSupply > 0) {
-            profitPerShare += (dividends * magnitude) / tokenSupply;
+        if (totalSupply() > 0) {
+            profitPerShare += (dividends * magnitude) / totalSupply();
         }
 
         (bool success, ) = seller.call{value: taxedEth}("");
@@ -90,10 +80,12 @@ contract LiquidityPoolTokens {
         emit TokenSale(seller, _amountOfTokens, taxedEth);
     }
 
-    // Withdraw dividends (10% fee for reinvestment)
-    function withdraw() external hasDividends {
-        address user = msg.sender;
+    // Withdraw dividends
+    function withdraw() external {
         uint256 dividends = myDividends();
+        require(dividends > 0, "No dividends available");
+
+        address user = msg.sender;
         payoutsTo[user] += int256(dividends * magnitude);
 
         (bool success, ) = user.call{value: dividends}("");
@@ -106,74 +98,78 @@ contract LiquidityPoolTokens {
         return address(this).balance;
     }
 
-    function totalSupply() external view returns (uint256) {
-        return tokenSupply;
-    }
-
     function myTokens() public view returns (uint256) {
-        return tokenBalanceLedger[msg.sender];
+        return balanceOf(msg.sender);
     }
 
     function myDividends() public view returns (uint256) {
         address user = msg.sender;
-        return uint256((int256(profitPerShare * tokenBalanceLedger[user]) - payoutsTo[user]) / int256(magnitude));
+        return
+            uint256(
+                (int256(profitPerShare * balanceOf(user)) - payoutsTo[user]) /
+                    int256(magnitude)
+            );
     }
 
     function sellPrice() public view returns (uint256) {
-        if (tokenSupply == 0) return tokenPriceInitial - tokenPriceIncremental;
-        return tokenPriceInitial + (tokenPriceIncremental * tokenSupply)*  9 / 10; // 10% fee adjustment
+        if (totalSupply() == 0)
+            return tokenPriceInitial - tokenPriceIncremental;
+        return
+            tokenPriceInitial +
+            ((tokenPriceIncremental * totalSupply()) * 9) /
+            10;
     }
 
     function buyPrice() public view returns (uint256) {
-        if (tokenSupply == 0) return tokenPriceInitial + tokenPriceIncremental;
-        return tokenPriceInitial + (tokenPriceIncremental * tokenSupply);
+        if (totalSupply() == 0)
+            return tokenPriceInitial + tokenPriceIncremental;
+        return tokenPriceInitial + (tokenPriceIncremental * totalSupply());
     }
 
-    function calculateTokensReceived(uint256 _eth) external view returns (uint256) {
+    function calculateTokensReceived(
+        uint256 _eth
+    ) external view returns (uint256) {
         uint256 dividends = _eth / dividendFee;
         uint256 taxedEth = _eth - dividends;
         return ethereumToTokens(taxedEth);
     }
 
-    function calculateEthereumReceived(uint256 _tokens) external view returns (uint256) {
-        require(_tokens <= tokenSupply, "Insufficient supply");
+    function calculateEthereumReceived(
+        uint256 _tokens
+    ) external view returns (uint256) {
+        require(_tokens <= totalSupply(), "Insufficient supply");
         uint256 eth = tokensToEthereum(_tokens);
         uint256 dividends = eth / dividendFee;
         return eth - dividends;
     }
 
-    /*==========================================
-    =            INTERNAL FUNCTIONS            =
+    /*========================================== 
+    =           INTERNAL FUNCTIONS            = 
     ==========================================*/
     function purchaseTokens(uint256 _incomingEth) internal returns (uint256) {
-        address buyer = msg.sender;
         uint256 dividends = _incomingEth / dividendFee;
         uint256 taxedEth = _incomingEth - dividends;
         uint256 amountOfTokens = ethereumToTokens(taxedEth);
 
-        require(amountOfTokens > 0 && (amountOfTokens + tokenSupply) > tokenSupply, "Invalid token amount");
+        // Debugging print
+        emit TokenPurchase(msg.sender, _incomingEth, amountOfTokens);
 
-        if (tokenSupply > 0) {
-            tokenSupply += amountOfTokens;
-            profitPerShare += (dividends * magnitude) / tokenSupply;
-        } else {
-            tokenSupply = amountOfTokens;
-        }
+        require(amountOfTokens > 0, "Invalid token amount");
 
-        tokenBalanceLedger[buyer] += amountOfTokens;
-        int256 updatedPayouts = int256(profitPerShare * amountOfTokens - (dividends * magnitude));
-        payoutsTo[buyer] += updatedPayouts;
-
-        emit TokenPurchase(buyer, _incomingEth, amountOfTokens);
+        _mint(msg.sender, amountOfTokens);
         return amountOfTokens;
     }
 
     function ethereumToTokens(uint256 _eth) internal view returns (uint256) {
-        uint256 tokens = (_eth * 1e18) / (tokenPriceInitial + (tokenPriceIncremental * tokenSupply));
-        return tokens;
+        return
+            (_eth * 10 ** 18) /
+            (tokenPriceInitial + (tokenPriceIncremental * totalSupply()));
     }
 
     function tokensToEthereum(uint256 _tokens) internal view returns (uint256) {
-        return (_tokens * (tokenPriceInitial + (tokenPriceIncremental * tokenSupply))) / 1e18;
+        return
+            (_tokens *
+                (tokenPriceInitial + (tokenPriceIncremental * totalSupply()))) /
+            10 ** 18;
     }
 }
