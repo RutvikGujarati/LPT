@@ -8,24 +8,23 @@ contract LiquidityPoolTokens is ERC20 {
     uint256 public constant tokenPriceIncremental = 10000000 wei; // 0.00000001 ETH
     uint256 public constant magnitude = 2 ** 64;
     uint256 public constant feePercent = 10;
-    uint256 public constant initialTokensPerEth = 9000 * 10 ** 18;
-    uint256 public constant MIN_INITIAL_BUY = 900000000000000000 wei; // 0.9 ETH
 
     uint256 public totalDividends;
     uint256 public profitPerShare;
 
     struct BuyRecord {
-        uint256 buyPrice; // Price per token at time of purchase (in wei)
-        uint256 ethCost; // ETH spent on this buy
-        uint256 tokenAmount; // Tokens bought
-        bool sold; // New flag to mark if this buy has been sold
+        uint256 buyPrice;
+        uint256 ethCost;
+        uint256 tokenAmount;
+        bool sold;
     }
 
     mapping(address => int256) public payoutsTo;
     mapping(address => uint256) public unclaimedDividends;
     mapping(address => uint256) public investedEth;
-    mapping(address => uint256) public buyCount; // Number of buys per user
-    mapping(address => mapping(uint256 => BuyRecord)) public buyRecords; // User -> Buy ID -> Record
+    mapping(address => uint256) public buyCount; // Active (unsold) buys
+    mapping(address => uint256) public totalBuyCount; // Total buys ever made
+    mapping(address => mapping(uint256 => BuyRecord)) public buyRecords;
 
     event TokensPurchased(
         address indexed buyer,
@@ -36,16 +35,11 @@ contract LiquidityPoolTokens is ERC20 {
     );
     event TokensSold(
         address indexed seller,
+        uint256 buyId,
         uint256 tokenAmount,
         uint256 ethAmount
     );
     event DividendsWithdrawn(address indexed user, uint256 ethAmount);
-    event TokensSold(
-        address indexed seller,
-        uint256 buyId, // Added buyId to track which buy is being sold
-        uint256 tokenAmount,
-        uint256 ethAmount
-    );
 
     constructor() ERC20("Liquidity Pool Tokens", "LPT") {}
 
@@ -63,35 +57,50 @@ contract LiquidityPoolTokens is ERC20 {
         return (buyPrice() * (100 - feePercent)) / 100;
     }
 
+    function calculateTokensForEth(
+        uint256 ethAmount
+    ) public view returns (uint256) {
+        if (ethAmount == 0) return 0;
+
+        uint256 fee = (ethAmount * feePercent) / 100;
+        uint256 taxedEth = ethAmount - fee;
+
+        uint256 S1 = totalSupply() / (10 ** decimals());
+        uint256 a = tokenPriceIncremental / 2;
+        uint256 b = tokenPriceInitial + (tokenPriceIncremental * S1);
+        uint256 discriminant = b * b + 4 * a * taxedEth;
+        uint256 tokens = (sqrt(discriminant) - b) / (2 * a);
+
+        return tokens * (10 ** decimals());
+    }
+
+    function calculateEthForTokens(
+        uint256 tokenAmount
+    ) public view returns (uint256) {
+        if (tokenAmount == 0) return 0;
+
+        uint256 S2 = totalSupply() / (10 ** decimals());
+        uint256 S1 = S2 - (tokenAmount / (10 ** decimals()));
+        uint256 baseAmount = (tokenPriceInitial * (S2 - S1)) +
+            (tokenPriceIncremental * (S2 * S2 - S1 * S1)) /
+            2;
+        uint256 fee = (baseAmount * feePercent) / 100;
+        return baseAmount - fee;
+    }
+
     function buy() public payable returns (uint256) {
         require(msg.value > 0, "Must send ETH to buy tokens");
 
-        uint256 fee = (msg.value * feePercent) / 100;
-        uint256 taxedEth = msg.value - fee;
-        uint256 currentBuyPrice = buyPrice();
-        uint256 tokensToBuy;
-
-        buyCount[msg.sender] += 1;
-        uint256 currentBuyId = buyCount[msg.sender];
-
-        if (totalSupply() == 0) {
-            require(
-                taxedEth >= MIN_INITIAL_BUY,
-                "First buy must be at least 0.9 ETH after fee"
-            );
-            tokensToBuy = (taxedEth * initialTokensPerEth) / MIN_INITIAL_BUY;
-        } else {
-            uint256 currentSupply = totalSupply() / (10 ** decimals());
-            uint256 startPrice = tokenPriceInitial +
-                (tokenPriceIncremental * currentSupply);
-            tokensToBuy = (taxedEth * 1e18) / startPrice;
-            if (currentSupply == 9000 && taxedEth == MIN_INITIAL_BUY) {
-                tokensToBuy = 4737 * 1e18;
-            }
-        }
+        uint256 tokensToBuy = calculateTokensForEth(msg.value);
         require(tokensToBuy > 0, "Insufficient ETH for tokens");
 
-        // Record the buy with sold flag set to false
+        uint256 fee = (msg.value * feePercent) / 100;
+        uint256 currentBuyPrice = buyPrice();
+
+        totalBuyCount[msg.sender] += 1; // Unique, incrementing ID for every buy
+        buyCount[msg.sender] += 1; // Track active buys
+        uint256 currentBuyId = totalBuyCount[msg.sender];
+
         buyRecords[msg.sender][currentBuyId] = BuyRecord({
             buyPrice: currentBuyPrice,
             ethCost: msg.value,
@@ -120,7 +129,10 @@ contract LiquidityPoolTokens is ERC20 {
     }
 
     function sell(uint256 _buyId) public returns (uint256) {
-        require(_buyId > 0 && _buyId <= buyCount[msg.sender], "Invalid buy ID");
+        require(
+            _buyId > 0 && _buyId <= totalBuyCount[msg.sender],
+            "Invalid buy ID"
+        );
         BuyRecord storage record = buyRecords[msg.sender][_buyId];
         require(!record.sold, "Tokens from this buy already sold");
         require(
@@ -129,9 +141,7 @@ contract LiquidityPoolTokens is ERC20 {
         );
 
         uint256 _amountOfTokens = record.tokenAmount;
-        uint256 currentPrice = sellPrice();
-        uint256 ethAmount = (_amountOfTokens * currentPrice) /
-            (10 ** decimals());
+        uint256 ethAmount = calculateEthForTokens(_amountOfTokens);
         require(ethAmount > 0, "ETH amount too low");
 
         if (totalSupply() > 0) {
@@ -140,16 +150,14 @@ contract LiquidityPoolTokens is ERC20 {
             payoutsTo[msg.sender] += int256(userDividends * magnitude);
 
             uint256 fee = (ethAmount * feePercent) / 100;
-            uint256 ethToSend = ethAmount - fee;
+            uint256 ethToSend = ethAmount;
+
             profitPerShare +=
                 (fee * magnitude) /
                 (totalSupply() / (10 ** decimals()));
             totalDividends += fee;
 
-            // Mark as sold instead of deleting
             record.sold = true;
-            // Decrease buy count since this buy is now completed
-            buyCount[msg.sender]--;
 
             _burn(msg.sender, _amountOfTokens);
             require(
@@ -204,37 +212,13 @@ contract LiquidityPoolTokens is ERC20 {
         uint256 invested = investedEth[_user];
         if (invested == 0) return (false, 0);
 
-        uint256 tokenValue = (balanceOf(_user) * sellPrice()) /
-            (10 ** decimals());
+        uint256 tokenValue = calculateEthForTokens(balanceOf(_user));
         uint256 totalValue = tokenValue + dividendsOf(_user);
 
         if (totalValue >= invested) {
             return (true, totalValue - invested);
         } else {
             return (false, invested - totalValue);
-        }
-    }
-
-    function calculateTokensForEth(
-        uint256 ethAmount
-    ) public view returns (uint256) {
-        if (ethAmount == 0) return 0;
-
-        uint256 fee = (ethAmount * feePercent) / 100;
-        uint256 taxedEth = ethAmount - fee;
-
-        if (totalSupply() == 0) {
-            if (taxedEth < MIN_INITIAL_BUY) return 0;
-            return (taxedEth * initialTokensPerEth) / MIN_INITIAL_BUY;
-        } else {
-            uint256 currentSupply = totalSupply() / (10 ** decimals());
-            uint256 startPrice = tokenPriceInitial +
-                (tokenPriceIncremental * currentSupply);
-            uint256 tokens = (taxedEth * 1e18) / startPrice;
-            if (currentSupply == 9000 && taxedEth == MIN_INITIAL_BUY) {
-                return 4737 * 1e18;
-            }
-            return tokens;
         }
     }
 
@@ -248,6 +232,10 @@ contract LiquidityPoolTokens is ERC20 {
 
     function getUserBuyCount(address _user) public view returns (uint256) {
         return buyCount[_user];
+    }
+
+    function getUserTotalBuyCount(address _user) public view returns (uint256) {
+        return totalBuyCount[_user];
     }
 
     function getBuyRecord(
@@ -264,18 +252,13 @@ contract LiquidityPoolTokens is ERC20 {
             int256 profitOrLoss
         )
     {
-        require(_buyId > 0 && _buyId <= buyCount[_user] + 1, "Invalid buy ID");
+        require(_buyId > 0 && _buyId <= totalBuyCount[_user], "Invalid buy ID");
         BuyRecord memory record = buyRecords[_user][_buyId];
 
         int256 pl = 0;
         if (!record.sold) {
-            uint256 currentValue = (record.tokenAmount * sellPrice()) /
-                (10 ** decimals());
+            uint256 currentValue = calculateEthForTokens(record.tokenAmount);
             pl = int256(currentValue) - int256(record.ethCost);
-        } else {
-            // For sold records, we can't calculate real profit/loss after the fact
-            // since we don't store the sell price
-            pl = 0;
         }
 
         return (
@@ -285,5 +268,36 @@ contract LiquidityPoolTokens is ERC20 {
             record.sold,
             pl
         );
+    }
+
+    // Helper function to get all active buy IDs for a user
+    function getActiveBuyIds(
+        address _user
+    ) public view returns (uint256[] memory) {
+        uint256 activeCount = buyCount[_user];
+        uint256[] memory activeIds = new uint256[](activeCount);
+        uint256 index = 0;
+
+        for (
+            uint256 i = 1;
+            i <= totalBuyCount[_user] && index < activeCount;
+            i++
+        ) {
+            if (!buyRecords[_user][i].sold) {
+                activeIds[index] = i;
+                index++;
+            }
+        }
+        return activeIds;
+    }
+
+    function sqrt(uint256 x) internal pure returns (uint256) {
+        uint256 z = (x + 1) / 2;
+        uint256 y = x;
+        while (z < y) {
+            y = z;
+            z = (x / z + z) / 2;
+        }
+        return y;
     }
 }
