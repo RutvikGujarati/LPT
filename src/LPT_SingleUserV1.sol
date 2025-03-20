@@ -39,6 +39,12 @@ contract LiquidityPoolTokens is ERC20 {
         uint256 ethAmount
     );
     event DividendsWithdrawn(address indexed user, uint256 ethAmount);
+    event TokensSold(
+        address indexed seller,
+        uint256 buyId, // Added buyId to track which buy is being sold
+        uint256 tokenAmount,
+        uint256 ethAmount
+    );
 
     constructor() ERC20("Liquidity Pool Tokens", "LPT") {}
 
@@ -111,8 +117,16 @@ contract LiquidityPoolTokens is ERC20 {
         return tokensToBuy;
     }
 
-    function sell(uint256 _amountOfTokens) public returns (uint256) {
-        require(_amountOfTokens > 0, "Must sell more than 0 tokens");
+    function sell(uint256 _buyId) public returns (uint256) {
+        require(_buyId > 0 && _buyId <= buyCount[msg.sender], "Invalid buy ID");
+        require(
+            buyRecords[msg.sender][_buyId].tokenAmount > 0,
+            "Buy already sold"
+        );
+
+        BuyRecord memory record = buyRecords[msg.sender][_buyId];
+        uint256 _amountOfTokens = record.tokenAmount;
+
         require(
             balanceOf(msg.sender) >= _amountOfTokens,
             "Insufficient token balance"
@@ -127,6 +141,7 @@ contract LiquidityPoolTokens is ERC20 {
             uint256 userDividends = dividendsOf(msg.sender);
             unclaimedDividends[msg.sender] += userDividends;
             payoutsTo[msg.sender] += int256(userDividends * magnitude);
+
             uint256 fee = (ethAmount * feePercent) / 100;
             uint256 ethToSend = ethAmount - fee;
             profitPerShare +=
@@ -134,7 +149,18 @@ contract LiquidityPoolTokens is ERC20 {
                 (totalSupply() / (10 ** decimals()));
             totalDividends += fee;
 
+            // Burn the tokens
             _burn(msg.sender, _amountOfTokens);
+
+            // Remove the buy record
+            delete buyRecords[msg.sender][_buyId];
+
+            // Decrease buy count
+            buyCount[msg.sender]--;
+
+            // Adjust invested ETH
+            investedEth[msg.sender] -= record.ethCost;
+
             require(
                 address(this).balance >= ethToSend,
                 "Insufficient contract balance"
@@ -142,10 +168,13 @@ contract LiquidityPoolTokens is ERC20 {
             (bool sent, ) = msg.sender.call{value: ethToSend}("");
             require(sent, "Failed to send ETH");
 
-            emit TokensSold(msg.sender, _amountOfTokens, ethToSend);
+            emit TokensSold(msg.sender, _buyId, _amountOfTokens, ethToSend);
             return ethToSend;
         } else {
             _burn(msg.sender, _amountOfTokens);
+            delete buyRecords[msg.sender][_buyId];
+            buyCount[msg.sender]--;
+            investedEth[msg.sender] -= record.ethCost;
             return 0;
         }
     }
@@ -238,16 +267,19 @@ contract LiquidityPoolTokens is ERC20 {
         public
         view
         returns (
-            uint256 buyPrice,
+            uint256 BuyPrice,
             uint256 ethCost,
             uint256 tokenAmount,
             int256 profitOrLoss
         )
     {
-        require(_buyId > 0 && _buyId <= buyCount[_user], "Invalid buy ID");
+        require(_buyId > 0 && _buyId <= buyCount[_user] + 1, "Invalid buy ID");
         BuyRecord memory record = buyRecords[_user][_buyId];
 
-        // Calculate current value of tokens bought in this transaction
+        if (record.tokenAmount == 0) {
+            return (0, 0, 0, 0); // Indicates this buy was already sold
+        }
+
         uint256 currentValue = (record.tokenAmount * sellPrice()) /
             (10 ** decimals());
         int256 pl = int256(currentValue) - int256(record.ethCost);
