@@ -18,6 +18,7 @@ contract LiquidityPoolTokens is ERC20 {
         uint256 buyPrice; // Price per token at time of purchase (in wei)
         uint256 ethCost; // ETH spent on this buy
         uint256 tokenAmount; // Tokens bought
+        bool sold; // New flag to mark if this buy has been sold
     }
 
     mapping(address => int256) public payoutsTo;
@@ -70,7 +71,7 @@ contract LiquidityPoolTokens is ERC20 {
         uint256 currentBuyPrice = buyPrice();
         uint256 tokensToBuy;
 
-        buyCount[msg.sender] += 1; // Increment buy count
+        buyCount[msg.sender] += 1;
         uint256 currentBuyId = buyCount[msg.sender];
 
         if (totalSupply() == 0) {
@@ -85,16 +86,17 @@ contract LiquidityPoolTokens is ERC20 {
                 (tokenPriceIncremental * currentSupply);
             tokensToBuy = (taxedEth * 1e18) / startPrice;
             if (currentSupply == 9000 && taxedEth == MIN_INITIAL_BUY) {
-                tokensToBuy = 4737 * 1e18; // Hardcoded adjustment
+                tokensToBuy = 4737 * 1e18;
             }
         }
         require(tokensToBuy > 0, "Insufficient ETH for tokens");
 
-        // Record the buy
+        // Record the buy with sold flag set to false
         buyRecords[msg.sender][currentBuyId] = BuyRecord({
             buyPrice: currentBuyPrice,
             ethCost: msg.value,
-            tokenAmount: tokensToBuy
+            tokenAmount: tokensToBuy,
+            sold: false
         });
 
         if (totalSupply() > 0) {
@@ -119,19 +121,14 @@ contract LiquidityPoolTokens is ERC20 {
 
     function sell(uint256 _buyId) public returns (uint256) {
         require(_buyId > 0 && _buyId <= buyCount[msg.sender], "Invalid buy ID");
+        BuyRecord storage record = buyRecords[msg.sender][_buyId];
+        require(!record.sold, "Tokens from this buy already sold");
         require(
-            buyRecords[msg.sender][_buyId].tokenAmount > 0,
-            "Buy already sold"
-        );
-
-        BuyRecord memory record = buyRecords[msg.sender][_buyId];
-        uint256 _amountOfTokens = record.tokenAmount;
-
-        require(
-            balanceOf(msg.sender) >= _amountOfTokens,
+            balanceOf(msg.sender) >= record.tokenAmount,
             "Insufficient token balance"
         );
 
+        uint256 _amountOfTokens = record.tokenAmount;
         uint256 currentPrice = sellPrice();
         uint256 ethAmount = (_amountOfTokens * currentPrice) /
             (10 ** decimals());
@@ -149,18 +146,12 @@ contract LiquidityPoolTokens is ERC20 {
                 (totalSupply() / (10 ** decimals()));
             totalDividends += fee;
 
-            // Burn the tokens
-            _burn(msg.sender, _amountOfTokens);
-
-            // Remove the buy record
-            delete buyRecords[msg.sender][_buyId];
-
-            // Decrease buy count
+            // Mark as sold instead of deleting
+            record.sold = true;
+            // Decrease buy count since this buy is now completed
             buyCount[msg.sender]--;
 
-            // Adjust invested ETH
-            investedEth[msg.sender] -= record.ethCost;
-
+            _burn(msg.sender, _amountOfTokens);
             require(
                 address(this).balance >= ethToSend,
                 "Insufficient contract balance"
@@ -171,10 +162,9 @@ contract LiquidityPoolTokens is ERC20 {
             emit TokensSold(msg.sender, _buyId, _amountOfTokens, ethToSend);
             return ethToSend;
         } else {
-            _burn(msg.sender, _amountOfTokens);
-            delete buyRecords[msg.sender][_buyId];
+            record.sold = true;
             buyCount[msg.sender]--;
-            investedEth[msg.sender] -= record.ethCost;
+            _burn(msg.sender, _amountOfTokens);
             return 0;
         }
     }
@@ -270,20 +260,30 @@ contract LiquidityPoolTokens is ERC20 {
             uint256 BuyPrice,
             uint256 ethCost,
             uint256 tokenAmount,
+            bool sold,
             int256 profitOrLoss
         )
     {
         require(_buyId > 0 && _buyId <= buyCount[_user] + 1, "Invalid buy ID");
         BuyRecord memory record = buyRecords[_user][_buyId];
 
-        if (record.tokenAmount == 0) {
-            return (0, 0, 0, 0); // Indicates this buy was already sold
+        int256 pl = 0;
+        if (!record.sold) {
+            uint256 currentValue = (record.tokenAmount * sellPrice()) /
+                (10 ** decimals());
+            pl = int256(currentValue) - int256(record.ethCost);
+        } else {
+            // For sold records, we can't calculate real profit/loss after the fact
+            // since we don't store the sell price
+            pl = 0;
         }
 
-        uint256 currentValue = (record.tokenAmount * sellPrice()) /
-            (10 ** decimals());
-        int256 pl = int256(currentValue) - int256(record.ethCost);
-
-        return (record.buyPrice, record.ethCost, record.tokenAmount, pl);
+        return (
+            record.buyPrice,
+            record.ethCost,
+            record.tokenAmount,
+            record.sold,
+            pl
+        );
     }
 }
