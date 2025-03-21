@@ -20,10 +20,10 @@ contract LiquidityPoolTokens is ERC20 {
     }
 
     mapping(address => int256) public payoutsTo;
-    mapping(address => uint256) public unclaimedDividends;
-    mapping(address => uint256) public investedEth;
-    mapping(address => uint256) public buyCount; // Active (unsold) buys
-    mapping(address => uint256) public totalBuyCount; // Total buys ever made
+    mapping(address => uint256) public unclaimedDividends; // Tracks dividends
+    mapping(address => uint256) public sellProceeds; // Tracks stuck ETH from sells
+    mapping(address => uint256) public investedEth; // Total ETH invested
+    mapping(address => uint256) public buyCount; // Total buys ever made
     mapping(address => mapping(uint256 => BuyRecord)) public buyRecords;
 
     event TokensPurchased(
@@ -40,6 +40,12 @@ contract LiquidityPoolTokens is ERC20 {
         uint256 ethAmount
     );
     event DividendsWithdrawn(address indexed user, uint256 ethAmount);
+    event Reinvested(
+        address indexed user,
+        uint256 ethAmount,
+        uint256 tokenAmount,
+        uint256 buyNumber
+    );
 
     constructor() ERC20("Liquidity Pool Tokens", "LPT") {}
 
@@ -97,9 +103,8 @@ contract LiquidityPoolTokens is ERC20 {
         uint256 fee = (msg.value * feePercent) / 100;
         uint256 currentBuyPrice = buyPrice();
 
-        totalBuyCount[msg.sender] += 1; // Unique, incrementing ID for every buy
-        buyCount[msg.sender] += 1; // Track active buys
-        uint256 currentBuyId = totalBuyCount[msg.sender];
+        buyCount[msg.sender] += 1;
+        uint256 currentBuyId = buyCount[msg.sender];
 
         buyRecords[msg.sender][currentBuyId] = BuyRecord({
             buyPrice: currentBuyPrice,
@@ -129,10 +134,7 @@ contract LiquidityPoolTokens is ERC20 {
     }
 
     function sell(uint256 _buyId) public returns (uint256) {
-        require(
-            _buyId > 0 && _buyId <= totalBuyCount[msg.sender],
-            "Invalid buy ID"
-        );
+        require(_buyId > 0 && _buyId <= buyCount[msg.sender], "Invalid buy ID");
         BuyRecord storage record = buyRecords[msg.sender][_buyId];
         require(!record.sold, "Tokens from this buy already sold");
         require(
@@ -159,39 +161,91 @@ contract LiquidityPoolTokens is ERC20 {
 
             record.sold = true;
 
+            sellProceeds[msg.sender] += ethToSend; // Add to stuck ETH
+
             _burn(msg.sender, _amountOfTokens);
-            require(
-                address(this).balance >= ethToSend,
-                "Insufficient contract balance"
-            );
-            (bool sent, ) = msg.sender.call{value: ethToSend}("");
-            require(sent, "Failed to send ETH");
 
             emit TokensSold(msg.sender, _buyId, _amountOfTokens, ethToSend);
             return ethToSend;
         } else {
             record.sold = true;
-            buyCount[msg.sender]--;
             _burn(msg.sender, _amountOfTokens);
             return 0;
         }
     }
-
-    function withdraw() public {
-        uint256 dividends = dividendsOf(msg.sender);
-        require(dividends > 0, "No dividends to withdraw");
+    // Modified reinvest function
+    function reinvest(uint256 stuckEth) public returns (uint256) {
         require(
-            address(this).balance >= dividends,
+            stuckEth <= sellProceeds[msg.sender],
+            "Insufficient sell proceeds"
+        );
+        require(stuckEth > 0, "Amount must be greater than 0");
+
+        uint256 tokensToBuy = calculateTokensForEth(stuckEth);
+        require(tokensToBuy > 0, "Insufficient ETH for tokens");
+
+        uint256 fee = (stuckEth * feePercent) / 100;
+        uint256 currentBuyPrice = buyPrice();
+
+        buyCount[msg.sender] += 1;
+        uint256 currentBuyId = buyCount[msg.sender];
+
+        buyRecords[msg.sender][currentBuyId] = BuyRecord({
+            buyPrice: currentBuyPrice,
+            ethCost: stuckEth,
+            tokenAmount: tokensToBuy,
+            sold: false
+        });
+
+        if (totalSupply() > 0) {
+            profitPerShare +=
+                (fee * magnitude) /
+                (totalSupply() / (10 ** decimals()));
+        }
+        totalDividends += fee;
+        investedEth[msg.sender] += stuckEth;
+        sellProceeds[msg.sender] -= stuckEth; // Deduct the reinvested amount (corrected from stuckEthCompetition)
+
+        _mint(msg.sender, tokensToBuy);
+
+        emit Reinvested(msg.sender, stuckEth, tokensToBuy, currentBuyId);
+        return tokensToBuy;
+    }
+
+    function withdraw(uint256 amount) public {
+        uint256 totalWithdrawable = unclaimedDividends[msg.sender] +
+            sellProceeds[msg.sender];
+        require(totalWithdrawable > 0, "No ETH to withdraw");
+        require(amount > 0, "Amount must be greater than 0");
+        require(
+            amount <= totalWithdrawable,
+            "Amount exceeds withdrawable balance"
+        );
+        require(
+            address(this).balance >= amount,
             "Insufficient contract balance"
         );
 
-        payoutsTo[msg.sender] += int256(dividends * magnitude);
-        unclaimedDividends[msg.sender] = 0;
+        // Calculate proportions of dividends and proceeds
+        uint256 dividends = unclaimedDividends[msg.sender];
+        uint256 proceeds = sellProceeds[msg.sender];
 
-        (bool sent, ) = msg.sender.call{value: dividends}("");
+        if (dividends > 0) {
+            uint256 dividendShare = (amount * dividends) / totalWithdrawable;
+            unclaimedDividends[msg.sender] -= dividendShare;
+            payoutsTo[msg.sender] += int256(dividendShare * magnitude);
+        }
+
+        if (proceeds > 0) {
+            uint256 proceedsShare = amount -
+                ((amount * dividends) / totalWithdrawable);
+            sellProceeds[msg.sender] -= proceedsShare;
+        }
+
+        (bool sent, ) = msg.sender.call{value: amount}("");
         require(sent, "Failed to send ETH");
 
-        emit DividendsWithdrawn(msg.sender, dividends);
+        emit DividendsWithdrawn(msg.sender, amount);
     }
 
     function dividendsOf(address _user) public view returns (uint256) {
@@ -208,12 +262,18 @@ contract LiquidityPoolTokens is ERC20 {
         return investedEth[_user];
     }
 
+    function getStuckEth(address _user) public view returns (uint256) {
+        return sellProceeds[_user]; // Only stuck ETH from sells
+    }
+
     function isUserInProfit(address _user) public view returns (bool, uint256) {
         uint256 invested = investedEth[_user];
         if (invested == 0) return (false, 0);
 
         uint256 tokenValue = calculateEthForTokens(balanceOf(_user));
-        uint256 totalValue = tokenValue + dividendsOf(_user);
+        uint256 totalValue = tokenValue +
+            dividendsOf(_user) +
+            sellProceeds[_user];
 
         if (totalValue >= invested) {
             return (true, totalValue - invested);
@@ -233,9 +293,25 @@ contract LiquidityPoolTokens is ERC20 {
     function getUserBuyCount(address _user) public view returns (uint256) {
         return buyCount[_user];
     }
+    function getUserProfit(address _user) public view returns (int256) {
+        uint256 invested = investedEth[_user];
+        if (invested == 0) return 0;
 
-    function getUserTotalBuyCount(address _user) public view returns (uint256) {
-        return totalBuyCount[_user];
+        uint256 tokenValue = calculateEthForTokens(balanceOf(_user));
+        uint256 dividends = dividendsOf(_user);
+        uint256 stuckEth = sellProceeds[_user];
+        uint256 totalValue = tokenValue + dividends + stuckEth;
+
+        return int256(totalValue) - int256(invested);
+    }
+    function getActiveBuyCount(address _user) public view returns (uint256) {
+        uint256 activeCount = 0;
+        for (uint256 i = 1; i <= buyCount[_user]; i++) {
+            if (!buyRecords[_user][i].sold) {
+                activeCount++;
+            }
+        }
+        return activeCount;
     }
 
     function getBuyRecord(
@@ -252,7 +328,7 @@ contract LiquidityPoolTokens is ERC20 {
             int256 profitOrLoss
         )
     {
-        require(_buyId > 0 && _buyId <= totalBuyCount[_user], "Invalid buy ID");
+        require(_buyId > 0 && _buyId <= buyCount[_user], "Invalid buy ID");
         BuyRecord memory record = buyRecords[_user][_buyId];
 
         int256 pl = 0;
@@ -270,19 +346,14 @@ contract LiquidityPoolTokens is ERC20 {
         );
     }
 
-    // Helper function to get all active buy IDs for a user
     function getActiveBuyIds(
         address _user
     ) public view returns (uint256[] memory) {
-        uint256 activeCount = buyCount[_user];
+        uint256 activeCount = getActiveBuyCount(_user);
         uint256[] memory activeIds = new uint256[](activeCount);
         uint256 index = 0;
 
-        for (
-            uint256 i = 1;
-            i <= totalBuyCount[_user] && index < activeCount;
-            i++
-        ) {
+        for (uint256 i = 1; i <= buyCount[_user]; i++) {
             if (!buyRecords[_user][i].sold) {
                 activeIds[index] = i;
                 index++;
