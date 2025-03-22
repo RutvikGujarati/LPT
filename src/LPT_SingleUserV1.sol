@@ -25,7 +25,7 @@ contract LiquidityPoolTokens is ERC20 {
     mapping(address => uint256) public investedEth; // Total ETH invested
     mapping(address => uint256) public buyCount; // Total buys ever made
     mapping(address => mapping(uint256 => BuyRecord)) public buyRecords;
-
+    mapping(address => uint256) public reinvestedEth;
     event TokensPurchased(
         address indexed buyer,
         uint256 ethAmount,
@@ -132,7 +132,6 @@ contract LiquidityPoolTokens is ERC20 {
         );
         return tokensToBuy;
     }
-
     function sell(uint256 _buyId) public returns (uint256) {
         require(_buyId > 0 && _buyId <= buyCount[msg.sender], "Invalid buy ID");
         BuyRecord storage record = buyRecords[msg.sender][_buyId];
@@ -146,13 +145,13 @@ contract LiquidityPoolTokens is ERC20 {
         uint256 ethAmount = calculateEthForTokens(_amountOfTokens);
         require(ethAmount > 0, "ETH amount too low");
 
+        uint256 fee = (ethAmount * feePercent) / 100;
+        uint256 ethToSend = ethAmount;
+
         if (totalSupply() > 0) {
             uint256 userDividends = dividendsOf(msg.sender);
             unclaimedDividends[msg.sender] += userDividends;
             payoutsTo[msg.sender] += int256(userDividends * magnitude);
-
-            uint256 fee = (ethAmount * feePercent) / 100;
-            uint256 ethToSend = ethAmount;
 
             profitPerShare +=
                 (fee * magnitude) /
@@ -160,8 +159,7 @@ contract LiquidityPoolTokens is ERC20 {
             totalDividends += fee;
 
             record.sold = true;
-
-            sellProceeds[msg.sender] += ethToSend; // Add to stuck ETH
+            sellProceeds[msg.sender] += ethToSend;
 
             _burn(msg.sender, _amountOfTokens);
 
@@ -173,7 +171,7 @@ contract LiquidityPoolTokens is ERC20 {
             return 0;
         }
     }
-    // Modified reinvest function
+
     function reinvest(uint256 stuckEth) public returns (uint256) {
         require(
             stuckEth <= sellProceeds[msg.sender],
@@ -203,8 +201,8 @@ contract LiquidityPoolTokens is ERC20 {
                 (totalSupply() / (10 ** decimals()));
         }
         totalDividends += fee;
-        investedEth[msg.sender] += stuckEth;
-        sellProceeds[msg.sender] -= stuckEth; // Deduct the reinvested amount (corrected from stuckEthCompetition)
+        reinvestedEth[msg.sender] += stuckEth;
+        sellProceeds[msg.sender] -= stuckEth; // Subtract only the used amount
 
         _mint(msg.sender, tokensToBuy);
 
@@ -212,9 +210,38 @@ contract LiquidityPoolTokens is ERC20 {
         return tokensToBuy;
     }
 
+    function dividendsOf(address _user) public view returns (uint256) {
+        // Check contract balance first - if no ETH, return 0
+        uint256 contractBalance = address(this).balance;
+        if (contractBalance == 0) return 0;
+
+        uint256 userBalance = balanceOf(_user);
+        uint256 totalDividendsForUser;
+
+        if (userBalance == 0) {
+            totalDividendsForUser = unclaimedDividends[_user];
+        } else {
+            // Calculate theoretical dividends from shares
+            uint256 totalPayout = (profitPerShare * userBalance) /
+                (10 ** decimals());
+            int256 adjustedPayout = int256(totalPayout) - payoutsTo[_user];
+            uint256 dividendsFromShares = adjustedPayout > 0
+                ? uint256(adjustedPayout) / magnitude
+                : 0;
+            totalDividendsForUser =
+                dividendsFromShares +
+                unclaimedDividends[_user];
+        }
+
+        // Cap at available contract balance or user's share, whichever is less
+        return
+            totalDividendsForUser > contractBalance
+                ? contractBalance
+                : totalDividendsForUser;
+    }
+
     function withdraw(uint256 amount) public {
-        uint256 totalWithdrawable = unclaimedDividends[msg.sender] +
-            sellProceeds[msg.sender];
+        uint256 totalWithdrawable = dividendsOf(msg.sender);
         require(totalWithdrawable > 0, "No ETH to withdraw");
         require(amount > 0, "Amount must be greater than 0");
         require(
@@ -226,20 +253,43 @@ contract LiquidityPoolTokens is ERC20 {
             "Insufficient contract balance"
         );
 
-        // Calculate proportions of dividends and proceeds
         uint256 dividends = unclaimedDividends[msg.sender];
         uint256 proceeds = sellProceeds[msg.sender];
 
+        // Calculate dividends from shares
+        uint256 userBalance = balanceOf(msg.sender);
+        uint256 dividendsFromShares = 0;
+        if (userBalance > 0) {
+            uint256 totalPayout = (profitPerShare * userBalance) /
+                (10 ** decimals());
+            int256 adjustedPayout = int256(totalPayout) - payoutsTo[msg.sender];
+            dividendsFromShares = adjustedPayout > 0
+                ? uint256(adjustedPayout) / magnitude
+                : 0;
+        }
+
+        // Theoretical total for proportional distribution
+        uint256 theoreticalTotal = dividendsFromShares + dividends + proceeds;
+        require(theoreticalTotal > 0, "No theoretical total to withdraw from");
+
+        // Calculate reductions based on actual withdrawable amount
+        uint256 dividendShare = 0;
+        uint256 proceedsShare = 0;
+        uint256 shareReduction = 0;
+
         if (dividends > 0) {
-            uint256 dividendShare = (amount * dividends) / totalWithdrawable;
+            dividendShare = (amount * dividends) / totalWithdrawable;
             unclaimedDividends[msg.sender] -= dividendShare;
-            payoutsTo[msg.sender] += int256(dividendShare * magnitude);
         }
 
         if (proceeds > 0) {
-            uint256 proceedsShare = amount -
-                ((amount * dividends) / totalWithdrawable);
+            proceedsShare = (amount * proceeds) / totalWithdrawable;
             sellProceeds[msg.sender] -= proceedsShare;
+        }
+
+        if (dividendsFromShares > 0) {
+            shareReduction = (amount * dividendsFromShares) / totalWithdrawable;
+            payoutsTo[msg.sender] += int256(shareReduction * magnitude);
         }
 
         (bool sent, ) = msg.sender.call{value: amount}("");
@@ -247,17 +297,23 @@ contract LiquidityPoolTokens is ERC20 {
 
         emit DividendsWithdrawn(msg.sender, amount);
     }
+    function getUserProfit(address _user) public view returns (int256) {
+        uint256 initialInvested = investedEth[_user];
+        uint256 reinvested = reinvestedEth[_user];
 
-    function dividendsOf(address _user) public view returns (uint256) {
-        uint256 userBalance = balanceOf(_user) / (10 ** decimals());
-        int256 totalPayout = int256(profitPerShare * userBalance);
-        int256 adjustedPayout = totalPayout - payoutsTo[_user];
-        uint256 dividendsFromShares = adjustedPayout > 0
-            ? uint256(adjustedPayout) / magnitude
-            : 0;
-        return dividendsFromShares + unclaimedDividends[_user];
+        if (initialInvested == 0 && reinvested == 0) return 0;
+
+        uint256 tokenValue = calculateEthForTokens(balanceOf(_user));
+        uint256 dividends = dividendsOf(_user);
+        uint256 stuckEth = sellProceeds[_user];
+        uint256 totalValue = tokenValue + dividends + stuckEth;
+
+        if (initialInvested == 0) {
+            return int256(totalValue);
+        } else {
+            return int256(totalValue) - int256(initialInvested);
+        }
     }
-
     function getInvestedEth(address _user) public view returns (uint256) {
         return investedEth[_user];
     }
@@ -293,17 +349,7 @@ contract LiquidityPoolTokens is ERC20 {
     function getUserBuyCount(address _user) public view returns (uint256) {
         return buyCount[_user];
     }
-    function getUserProfit(address _user) public view returns (int256) {
-        uint256 invested = investedEth[_user];
-        if (invested == 0) return 0;
 
-        uint256 tokenValue = calculateEthForTokens(balanceOf(_user));
-        uint256 dividends = dividendsOf(_user);
-        uint256 stuckEth = sellProceeds[_user];
-        uint256 totalValue = tokenValue + dividends + stuckEth;
-
-        return int256(totalValue) - int256(invested);
-    }
     function getActiveBuyCount(address _user) public view returns (uint256) {
         uint256 activeCount = 0;
         for (uint256 i = 1; i <= buyCount[_user]; i++) {
